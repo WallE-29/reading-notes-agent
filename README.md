@@ -26,6 +26,8 @@ Most note-taking tools ask you to fill in fields. This one deliberately does not
 
 3. **Model choice as a variable, not a setting.** The agent supports runtime switching between Claude and DeepSeek. Switching mid-session is partly a cost decision, partly an experiment: different backends produce noticeably different output structure, which is useful evidence when thinking about how model capability shapes the artifacts people end up keeping.
 
+4. **A two-layer memory, not a log.** The agent keeps an append-only episodic store of reading preferences across books, and separately maintains a synthesized reader profile that gets rewritten as evidence accumulates. Raw observations and the consolidated model are deliberately kept apart: consolidation is a judgement call, and keeping both makes it auditable. Extraction is deduplicated (no new signal, no new entry) and retried at next launch if a session ended abnormally, so the agent's model of its reader is not silently lost. Personal data files stay local and are git-ignored.
+
 ## Features
 
 - 💬 Conversational reading experience: multi-turn dialogue, not one-shot Q&A
