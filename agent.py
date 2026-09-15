@@ -13,6 +13,9 @@
   - 智能作者背景检索
   - 会话存档 & 记忆恢复
   - 运行时切换模型 (/model 命令)
+  - 跨书记忆 memory.md: 会话结束时提炼读书偏好,追加写入,所有书共享
+    (Ctrl+C / 关窗口 / 崩溃等异常退出后,下次启动自动补做提炼,记忆不丢)
+  - 读者画像 profile.md: 首次启动问答建档,之后以文艺笔触持续更新
 
 Usage:
     python agent.py                                    # 自动检测 Key 类型
@@ -221,6 +224,100 @@ def read_existing_note(fp: Path) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# 跨书记忆 & 读者画像 (memory.md / profile.md)
+# ---------------------------------------------------------------------------
+MEMORY_FILE  = PROJECT_DIR / "memory.md"
+PROFILE_FILE = PROJECT_DIR / "profile.md"
+PORTRAIT_MARKER = "## 画像速写"          # profile.md 中"初次相识"骨架与画像正文的分界线
+MEMORY_PROMPT_CHAR_LIMIT = 6000         # 注入提示词的 memory.md 字数上限 (超长保尾部)
+PROFILE_QUESTIONS = [
+    ("偏爱",        "你偏爱中国文学还是外国文学,或都喜欢?"),
+    ("最喜欢的作者", "你最喜欢的作者是谁?"),
+    ("关注点",      "你读书时最关注什么 (人物 / 情节 / 思想 / 文笔)?"),
+]
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """安全写入: 先写临时文件再原子替换,避免写一半把原文件损坏。"""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"  {Style.RED}[!] 写入 {path.name} 失败: {e}{Style.RESET}")
+
+
+def read_markdown(path: Path) -> str:
+    """读取 utf-8 markdown 文件; 不存在或读取失败返回空串 (等同未建档)。"""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def read_memory_for_prompt() -> str:
+    """读取跨书记忆供提示词注入; 超长时截尾保留 (最新记录在文件末尾)。"""
+    text = read_markdown(MEMORY_FILE).strip()
+    if len(text) > MEMORY_PROMPT_CHAR_LIMIT:
+        text = "(更早的记忆已省略)\n\n" + text[-MEMORY_PROMPT_CHAR_LIMIT:]
+    return text
+
+
+def append_memory_entries(book_label: str, entries: str) -> bool:
+    """向 memory.md 追加一段新记忆 (追加式, 不改写历史); 返回是否实际写入。"""
+    entries = entries.strip()
+    if not entries:
+        return False
+    old = read_markdown(MEMORY_FILE)
+    if not old.strip():
+        old = ("# 跨书记忆\n\n"
+               "> 读书搭子的跨书偏好记忆 — 记录读者在一次次共读中显露的品味与倾向。\n"
+               "> 由 AI 在会话结束后提炼追加;只增不删,不与某本书绑定。\n")
+    today = datetime.now().strftime("%Y-%m-%d")
+    block = f"\n## {today} · {book_label}\n\n{entries}\n"
+    atomic_write_text(MEMORY_FILE, old.rstrip("\n") + "\n" + block)
+    return True
+
+
+def init_profile_file(answers: list[tuple[str, str]]) -> None:
+    """首次启动: 把基础问答写成读者画像的初始骨架。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = ["# 读者画像", "", f"## 初次相识 ({today})", ""]
+    for label, answer in answers:
+        lines.append(f"- {label}: {answer}")
+    lines += ["", PORTRAIT_MARKER, "", "(刚刚认识这位读者,画像还在慢慢成形……)", ""]
+    atomic_write_text(PROFILE_FILE, "\n".join(lines))
+
+
+def get_current_portrait() -> str:
+    """取 profile.md 画像速写区的内容 (无则返回空串)。"""
+    old = read_markdown(PROFILE_FILE)
+    if PORTRAIT_MARKER in old:
+        return old.split(PORTRAIT_MARKER, 1)[1].strip()
+    return ""
+
+
+def update_profile_portrait(portrait: str) -> None:
+    """更新 profile.md 的画像速写区,程序化保留"初次相识"问答骨架。"""
+    portrait = portrait.strip()
+    if not portrait:
+        return
+    old = read_markdown(PROFILE_FILE)
+    if PORTRAIT_MARKER in old:
+        head = old.split(PORTRAIT_MARKER, 1)[0].rstrip("\n") + "\n\n"
+        new_content = head + PORTRAIT_MARKER + "\n\n" + portrait + "\n"
+    elif old.strip():
+        new_content = old.rstrip("\n") + "\n\n" + PORTRAIT_MARKER + "\n\n" + portrait + "\n"
+    else:
+        new_content = "# 读者画像\n\n" + PORTRAIT_MARKER + "\n\n" + portrait + "\n"
+    atomic_write_text(PROFILE_FILE, new_content)
+
+
 def format_book_label(book_name: str, author: str = "") -> str:
     if author:
         return f"《{book_name}》— {author}"
@@ -275,7 +372,9 @@ SYSTEM_PROMPT_KNOWN = PERSONA + "\n\n" + textwrap.dedent("""\
     4. **边界**: 你不是维基百科,不是老师在出题。不要列清单,不要做总结陈词,
        不要给出"正确解读"。你是在和一个活人聊一本你们都读过的书。
 
-    {memory_context}""")
+    {memory_context}
+
+    {cross_book_context}""")
 
 SYSTEM_PROMPT_UNKNOWN = PERSONA + "\n\n" + textwrap.dedent("""\
     ## 当前模式: 盲盒盲读
@@ -306,7 +405,9 @@ SYSTEM_PROMPT_UNKNOWN = PERSONA + "\n\n" + textwrap.dedent("""\
     4. **边界**: 你不是在审稿,不是在假装你懂。你是在陪一个人慢慢把一本书"吃透"。
        你的无知是真诚的,你的好奇也是真诚的。{author_boundary_note}
 
-    {memory_context}""")
+    {memory_context}
+
+    {cross_book_context}""")
 
 MINDMAP_GENERATION_PROMPT = textwrap.dedent("""\
     你是一个专业的读书笔记整理助手。根据以下对话历史,为《{book_name}》{author_context}生成两份
@@ -328,6 +429,28 @@ MINDMAP_GENERATION_PROMPT = textwrap.dedent("""\
     - 只基于对话中实际出现的内容构建
     - 这是对现有笔记的**更新**,保留已有结构,补充新内容
     - 作者相关信息也纳入笔记""")
+
+MEMORY_UPDATE_PROMPT = textwrap.dedent("""\
+    你是读书搭子的"记忆管理员",负责维护两份关于读者的档案。根据用户提供的本次
+    会话完整对话与现有档案,输出两部分内容:
+
+    ## 第一部分: 新增记忆条目
+    - 只记录这次对话中**新显露**的读书偏好: 喜欢的作者/类型、偏好的分析角度、
+      情感倾向、聊书时的习惯等。
+    - 每条一行,以 "- " 开头,写得具体 (不要"喜欢读书"这类空话)。
+    - 不要与现有跨书记忆重复;没有新的偏好信号就只输出: NONE
+
+    ## 第二部分: 画像速写 (全文重写)
+    - 综合现有记忆、现有速写和这次对话,用第三人称重写这位读者的画像:
+      ta 偏爱的文学版图、关注书的哪些维度、聊书时的神采与温度。
+    - 150-250 字,文艺、细腻,像给老朋友写的一幅侧写,不要罗列标签。
+    - 画像确实无需变化时,只输出: UNCHANGED
+
+    ## 输出格式 (严格遵守)
+    第一部分内容
+    =======SPLIT=======
+    第二部分内容
+    除这两部分外不要输出任何其他内容。""")
 
 # ---------------------------------------------------------------------------
 # CLI 界面
@@ -635,6 +758,24 @@ class ReadingBuddyAgent:
         lines.append("以上就是之前的对话记录。请从现在开始继续聊。")
         return "\n".join(lines)
 
+    def _build_cross_book_context(self) -> str:
+        """把 profile.md + memory.md 拼成可注入系统提示词的跨书上下文。"""
+        sections = []
+        profile = read_markdown(PROFILE_FILE).strip()
+        memory = read_memory_for_prompt()
+        if profile:
+            sections.append("### 读者画像 (profile.md)\n\n" + profile)
+        if memory:
+            sections.append("### 跨书记忆 (memory.md)\n\n" + memory)
+        if not sections:
+            return ""
+        return (
+            "## 关于这位读者 (跨书信息)\n\n"
+            + "\n\n".join(sections)
+            + "\n\n以上是你和这位读者跨书相处的记录。像老朋友记得对方的口味那样自然地用起来:"
+              "聊到相关的作品或角度时可以顺势提起,但不要机械复述、不要罗列,更不要评头论足。"
+        )
+
     # ------------------------------------------------------------------
     # Step 2: 启动会话
     # ------------------------------------------------------------------
@@ -651,12 +792,14 @@ class ReadingBuddyAgent:
 
             memory_ctx = self._build_memory_context()
             a_ctx = self._build_author_context_for_prompt()
+            cross_ctx = self._build_cross_book_context()
 
             if self.mode == "known":
                 self.system_prompt = SYSTEM_PROMPT_KNOWN.format(
                     book_name=self.book_name,
                     author_line=a_ctx["author_line"],
                     memory_context=memory_ctx,
+                    cross_book_context=cross_ctx,
                 )
             else:
                 self.system_prompt = SYSTEM_PROMPT_UNKNOWN.format(
@@ -668,6 +811,7 @@ class ReadingBuddyAgent:
                     author_nav_hint=a_ctx["author_nav_hint"],
                     author_boundary_note=a_ctx["author_boundary_note"],
                     memory_context=memory_ctx,
+                    cross_book_context=cross_ctx,
                 )
 
             print()
@@ -696,6 +840,7 @@ class ReadingBuddyAgent:
                     print(f"  {Style.DIM}({info[:100]}……){Style.RESET}")
 
             a_ctx = self._build_author_context_for_prompt()
+            cross_ctx = self._build_cross_book_context()
 
             if mode == "known":
                 self.mode = "known"
@@ -703,6 +848,7 @@ class ReadingBuddyAgent:
                     book_name=self.book_name,
                     author_line=a_ctx["author_line"],
                     memory_context="",
+                    cross_book_context=cross_ctx,
                 )
                 print()
                 print(f"  {Style.GREEN}[OK] 我读过这本书!{Style.RESET}")
@@ -718,6 +864,7 @@ class ReadingBuddyAgent:
                     author_nav_hint=a_ctx["author_nav_hint"],
                     author_boundary_note=a_ctx["author_boundary_note"],
                     memory_context="",
+                    cross_book_context=cross_ctx,
                 )
                 print()
                 if self.author_info:
@@ -756,6 +903,9 @@ class ReadingBuddyAgent:
             return "command_handled"
         if s.lower() in ("/author", "/author-info"):
             self._cmd_author_info()
+            return "command_handled"
+        if s.lower() in ("/profile", "/me"):
+            self._cmd_profile()
             return "command_handled"
         if s.lower() == "/help":
             self._cmd_help()
@@ -873,6 +1023,100 @@ class ReadingBuddyAgent:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    # 跨书记忆 & 读者画像
+    # ------------------------------------------------------------------
+    def _maybe_init_profile(self) -> None:
+        """首次启动: profile.md 不存在时,问 3 个基础问题建立画像骨架。"""
+        if PROFILE_FILE.exists():
+            return
+        print(f"  {Style.BLUE}{Style.BOLD}[🪞] 第一次见面,先认识你一下——3 个小问题{Style.RESET}")
+        print(f"  {Style.DIM}(每个问题直接回车可跳过,聊得多了画像自然会清晰){Style.RESET}")
+        print()
+        answers = []
+        for label, question in PROFILE_QUESTIONS:
+            a = input(f"  {Style.CYAN}{question}{Style.RESET} ").strip()
+            answers.append((label, a if a else "(未透露)"))
+        init_profile_file(answers)
+        print()
+        print(f"  {Style.GREEN}[OK] 已建档 -> {PROFILE_FILE.name},之后每次聊完都会补全它{Style.RESET}")
+        print()
+
+    def _update_user_memory(self) -> bool:
+        """会话结束时一次性运行: 提炼本次对话的读者偏好追加到 memory.md,
+        并基于记忆更新 profile.md 的画像速写。
+        返回 True 表示提炼流程执行完成 (含"无新信号"); False 表示跳过或失败。
+        成功后把会话存档标记为 memory_extracted=true,供下次启动判断是否补提炼。"""
+        if len(self.messages) < 4:
+            self._mark_memory_extracted()  # 只有开场寒暄,无内容可提炼,同样标记完成
+            return False
+        label = format_book_label(self.book_name, self.author)
+        history = self._build_history_summary()  # 复用脑图生成的对话摘要 (最近 20 轮)
+
+        user_content = textwrap.dedent(f"""\
+            ## 本次会话完整对话 (正在共读: {label})
+            {history}
+
+            ---
+            ## 现有跨书记忆 (memory.md)
+            {read_memory_for_prompt() or "(尚无记录)"}
+
+            ---
+            ## 现有画像速写 (profile.md)
+            {get_current_portrait() or "(尚无画像)"}""")
+
+        print_status("正在提炼跨书记忆……", Style.DIM)
+        try:
+            raw = self._api_create(
+                system=MEMORY_UPDATE_PROMPT,
+                messages=[{"role": "user", "content": user_content}],
+                max_tokens=1000,
+                temperature=0.3,
+            )
+            entry_part, portrait_part = self._parse_memory_output(raw)
+            if entry_part:
+                append_memory_entries(label, entry_part)
+                print_status(f"[OK] 跨书记忆已更新 -> {MEMORY_FILE.name}", Style.GREEN)
+            if portrait_part:
+                update_profile_portrait(portrait_part)
+                print_status(f"[OK] 读者画像已更新 -> {PROFILE_FILE.name}", Style.GREEN)
+            if not entry_part and not portrait_part:
+                print_status("这次没有新的偏好信号", Style.DIM)
+            self._mark_memory_extracted()
+            return True
+        except Exception as e:
+            if self._error_is_403(e):
+                print_status("[!] 跨书记忆更新被拒 (403),这次跳过。", Style.YELLOW)
+            else:
+                print_status(f"[!] 跨书记忆更新失败 (不影响对话): {e}", Style.YELLOW)
+            return False
+
+    def _mark_memory_extracted(self) -> None:
+        """把当前书的会话存档标记为"记忆已提炼",避免下次启动重复补提炼。"""
+        data = load_session(self.book_name, self.author)
+        if data:
+            data["memory_extracted"] = True
+            save_session(self.book_name, data, self.author)
+
+    @staticmethod
+    def _parse_memory_output(raw: str) -> tuple[str, str]:
+        """拆解记忆管理员的输出 → (新增记忆条目, 新画像速写); 空串表示无需更新。"""
+        raw = re.sub(r'^```[a-zA-Z]*\s*', '', raw.strip())
+        raw = re.sub(r'\s*```$', '', raw).strip()
+        parts = re.split(r'=+\s*SPLIT\s*=+', raw, maxsplit=1)
+
+        def drop_headers(text: str) -> str:
+            lines = [l for l in text.strip().splitlines() if not l.strip().startswith("#")]
+            return "\n".join(lines).strip()
+
+        entry = drop_headers(parts[0]) if parts else ""
+        portrait = drop_headers(parts[1]) if len(parts) > 1 else ""
+        if entry.upper().rstrip("。.!;；").replace(" ", "") in ("", "NONE", "无新增"):
+            entry = ""
+        if portrait.upper().rstrip("。.!;；").replace(" ", "") in ("", "UNCHANGED", "无变化"):
+            portrait = ""
+        return entry, portrait
+
+    # ------------------------------------------------------------------
     # 命令
     # ------------------------------------------------------------------
     def _cmd_model(self, raw_input: str):
@@ -938,6 +1182,27 @@ class ReadingBuddyAgent:
             print(f"  {Style.DIM}关于 {self.author} 没有额外的背景信息{Style.RESET}")
         print()
 
+    def _cmd_profile(self):
+        print()
+        profile = read_markdown(PROFILE_FILE).strip()
+        memory = read_markdown(MEMORY_FILE).strip()
+        if not profile and not memory:
+            print(f"  {Style.DIM}还没有读者画像和跨书记忆{Style.RESET}")
+            print()
+            return
+        if profile:
+            print(f"  {Style.BLUE}{Style.BOLD}🪞 读者画像 ({PROFILE_FILE.name}):{Style.RESET}")
+            print()
+            for line in profile.splitlines():
+                print(f"  {line}" if line.strip() else "")
+        if memory:
+            print()
+            print(f"  {Style.BLUE}{Style.BOLD}📚 跨书记忆 ({MEMORY_FILE.name}):{Style.RESET}")
+            print()
+            for line in memory.splitlines():
+                print(f"  {line}" if line.strip() else "")
+        print()
+
     def _cmd_history(self):
         sessions = list_all_sessions()
         print()
@@ -963,6 +1228,7 @@ class ReadingBuddyAgent:
         print()
         print(f"  {Style.CYAN}/model [模型名]{Style.RESET}  — 查看或切换模型")
         print(f"  {Style.CYAN}/author{Style.RESET}          — 查看作者背景信息")
+        print(f"  {Style.CYAN}/profile, /me{Style.RESET}    — 查看读者画像 & 跨书记忆")
         print(f"  {Style.CYAN}/save{Style.RESET}            — 手动存档")
         print(f"  {Style.CYAN}/history{Style.RESET}        — 查看所有存档会话")
         print(f"  {Style.CYAN}/quit, /exit, /q{Style.RESET} — 退出")
@@ -984,6 +1250,7 @@ class ReadingBuddyAgent:
             "base_url": self.base_url,
             "created_at": getattr(self, "_session_created_at", datetime.now(timezone.utc).isoformat()),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "memory_extracted": False,   # 本份存档内容尚未提炼;提炼成功后由 _mark_memory_extracted 翻成 true
             "messages": self.messages,
         }
         if not hasattr(self, "_session_created_at"):
@@ -996,6 +1263,10 @@ class ReadingBuddyAgent:
     # ------------------------------------------------------------------
     def run(self):
         print_banner()
+
+        self._maybe_init_profile()
+        if PROFILE_FILE.exists() or MEMORY_FILE.exists():
+            print_status("读者画像 & 跨书记忆已就绪 (/profile 可查看)", Style.DIM)
 
         book_name = input(f"  {Style.CYAN}请输入你在读的书名:{Style.RESET} ").strip()
         while not book_name:
@@ -1029,6 +1300,16 @@ class ReadingBuddyAgent:
             print(f"  {Style.DIM}  模式: {'经典引导' if prev_mode == 'known' else '盲盒盲读'}{Style.RESET}")
             print(f"  {Style.DIM}  后端: {prev_provider} · 模型: {prev_model}{Style.RESET}")
             print()
+
+            # 上次异常退出 (Ctrl+C / 关窗口 / 崩溃) 时,退出环节的提炼没跑成 → 先基于存档补做。
+            # 放在选择菜单之前: 无论用户选"继续"还是"重新开始",旧对话的偏好都不丢。
+            if previous.get("memory_extracted") is False:
+                self.book_name = book_name
+                self.author = prev_author or author
+                self.messages = prev_msg
+                print(f"  {Style.YELLOW}[!] 检测到上次会话未提炼,正在补做跨书记忆…{Style.RESET}")
+                self._update_user_memory()
+                print()
 
             print(f"  {Style.CYAN}请选择:{Style.RESET}")
             print(f"  {Style.GREEN}[1]{Style.RESET} 继续之前的对话")
@@ -1069,24 +1350,35 @@ class ReadingBuddyAgent:
         print()
         info = PROVIDER_INFO[self.provider]
         print(f"  {Style.DIM}━━━  后端: {info['name']} | 每次回答后自动存档 & 更新脑图  ━━━{Style.RESET}")
-        print(f"  {Style.DIM}  命令: /model 切换模型 | /author 作者背景 | /save 手动存档 | /history 历史 | /quit 退出{Style.RESET}")
+        print(f"  {Style.DIM}  命令: /model 切换模型 | /author 作者背景 | /profile 画像&记忆 | /save 手动存档 | /history 历史 | /quit 退出{Style.RESET}")
         print()
 
         turn_count = (len(self.messages) // 2) + 1
-        while True:
-            user_input = get_multiline_input(f">> 第 {turn_count} 轮 - 你想分享/讨论什么?")
-            if not user_input.strip():
-                continue
-            result = self.chat_turn(user_input)
-            if result == "quit":
-                label = format_book_label(self.book_name, self.author)
-                print()
-                print(f"  {Style.CYAN}今天就聊到这儿吧。notes/ 里有笔记,下次继续!{Style.RESET}")
-                print(f"  {Style.DIM}会话已自动存档,下次打开{label}可以接着聊~{Style.RESET}")
-                print()
-                break
-            elif result == "continue":
-                turn_count += 1
+        interrupted = False
+        try:
+            while True:
+                user_input = get_multiline_input(f">> 第 {turn_count} 轮 - 你想分享/讨论什么?")
+                if not user_input.strip():
+                    continue
+                result = self.chat_turn(user_input)
+                if result == "quit":
+                    label = format_book_label(self.book_name, self.author)
+                    print()
+                    print(f"  {Style.CYAN}今天就聊到这儿吧。notes/ 里有笔记,下次继续!{Style.RESET}")
+                    print(f"  {Style.DIM}会话已自动存档,下次打开{label}可以接着聊~{Style.RESET}")
+                    print()
+                    break
+                elif result == "continue":
+                    turn_count += 1
+        except KeyboardInterrupt:
+            interrupted = True
+            print()
+            print(f"  {Style.YELLOW}[!] 收到 Ctrl+C,正在收尾……{Style.RESET}")
+
+        # 对话结束 (正常 /quit 或 Ctrl+C): 一次性提炼本次会话的偏好 → 跨书记忆 & 画像 (单次 API 调用)
+        saved = self._update_user_memory()
+        if interrupted and saved:
+            print(f"  {Style.GREEN}[已保存] 跨书记忆{Style.RESET}")
 
         label = format_book_label(self.book_name, self.author)
         mp, mubu = get_mindmap_paths(self.book_name, self.author)
@@ -1095,6 +1387,8 @@ class ReadingBuddyAgent:
         print(f"     {Style.GREEN}[存档] 会话记录:{Style.RESET} {sp}")
         print(f"     {Style.GREEN}[脑图] 可视化脑图:{Style.RESET} {mp}")
         print(f"     {Style.GREEN}[大纲] 幕布导入版:{Style.RESET} {mubu}")
+        print(f"     {Style.GREEN}[记忆] 跨书记忆:{Style.RESET} {MEMORY_FILE}")
+        print(f"     {Style.GREEN}[画像] 读者画像:{Style.RESET} {PROFILE_FILE}")
         print()
 
 

@@ -7,6 +7,9 @@ config.json
 
 # === 会话数据（个人隐私）===
 sessions/
+memory.md
+profile.md
+*.tmp
 
 # === Python ===
 __pycache__/
