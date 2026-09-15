@@ -16,6 +16,16 @@ Reading isn't a form to fill out. The buddy's logic is:
 
 You do the talking; it turns the chat into notes.
 
+## Design rationale
+
+Most note-taking tools ask you to fill in fields. This one deliberately does not, and the reasoning is worth stating:
+
+1. **Conversational interaction over forms.** Reading notes are an act of interpretation, not data entry. Free-form dialogue lets the user keep the interpretive work — associations, doubts, half-formed reactions — and defers structuring until later. The system externalizes the exchange into artifacts (Mermaid mind maps, outline exports) instead of demanding structure up front.
+
+2. **A deliberate division of labour.** The user makes meaning; the agent handles structuring, recall, and format generation. Persistent session memory keeps that division stable across long-horizon interactions — an agent that forgets degrades back into a tool.
+
+3. **Model choice as a variable, not a setting.** The agent supports runtime switching between Claude and DeepSeek. Switching mid-session is partly a cost decision, partly an experiment: different backends produce noticeably different output structure, which is useful evidence when thinking about how model capability shapes the artifacts people end up keeping.
+
 ## Features
 
 - 💬 Conversational reading experience: multi-turn dialogue, not one-shot Q&A
