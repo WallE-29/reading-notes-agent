@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的书架 · 读书搭子</title>
+<!-- defer: CDN 不可达时不阻塞页面渲染, 渲染层自动降级为纯文本 -->
+<script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<style>
+:root {
+  --bg: #f6f4ef;
+  --card: #ffffff;
+  --text: #2c2a26;
+  --muted: #8d887d;
+  --border: #e6e2d8;
+  --accent: #a86a3d;
+  --accent-soft: #f4e9df;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 15px; line-height: 1.65;
+}
+header {
+  max-width: 1280px; margin: 0 auto; padding: 26px 24px 4px;
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+}
+header h1 { font-size: 24px; margin: 0; }
+#stats { color: var(--muted); font-size: 14px; }
+main {
+  max-width: 1280px; margin: 0 auto; padding: 14px 24px 48px;
+  display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; align-items: start;
+}
+/* ---- 书架网格 ---- */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; }
+.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 16px 14px; min-height: 118px; cursor: pointer;
+  display: flex; flex-direction: column; gap: 5px; text-align: left;
+  font: inherit; color: inherit;
+  transition: box-shadow .15s ease, transform .15s ease;
+}
+.card:hover { box-shadow: 0 4px 14px rgba(70,55,30,.12); transform: translateY(-2px); }
+.card-title { font-size: 17px; font-weight: 600; }
+.card-author { color: var(--muted); font-size: 13px; }
+.card-meta { margin-top: auto; padding-top: 10px; display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.chip { background: var(--accent-soft); color: var(--accent); border-radius: 999px; padding: 1px 8px; font-size: 11px; }
+.date { margin-left: auto; }
+/* ---- 提示 / 占位 ---- */
+.hint {
+  grid-column: 1 / -1; background: var(--card); border: 1px dashed var(--border);
+  border-radius: 10px; padding: 36px 24px; text-align: center; color: var(--muted);
+}
+.hint code { background: var(--accent-soft); color: var(--accent); padding: 2px 7px; border-radius: 5px; }
+.placeholder { color: var(--muted); }
+/* ---- 侧边栏 ---- */
+#sidebar { display: flex; flex-direction: column; gap: 20px; position: sticky; top: 16px; }
+.panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.panel h2 { font-size: 16px; margin: 0 0 10px; }
+.panel .body { max-height: 42vh; overflow-y: auto; }
+/* ---- markdown 渲染 ---- */
+.md :first-child { margin-top: 0; }
+.md h1, .md h2, .md h3 { margin: 18px 0 8px; line-height: 1.35; }
+.md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15px; }
+.md pre {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.5;
+}
+.md code { background: var(--bg); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+.md pre code { background: none; padding: 0; }
+.md blockquote {
+  margin: 10px 0; padding: 6px 14px; border-left: 3px solid var(--accent);
+  background: var(--accent-soft); border-radius: 0 8px 8px 0; color: #6d6357;
+}
+.md table { border-collapse: collapse; margin: 10px 0; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 10px; font-size: 14px; }
+.md ul, .md ol { padding-left: 22px; }
+.offline-hint {
+  background: #fbf3d9; border: 1px solid #ecdfae; color: #7a6420;
+  padding: 8px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 12px;
+}
+/* ---- 笔记弹窗 ---- */
+.modal { position: fixed; inset: 0; z-index: 50; background: rgba(45,38,26,.42);
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.modal[hidden] { display: none; }
+.modal-panel {
+  background: var(--card); border-radius: 12px; width: min(880px, 100%);
+  max-height: 86vh; display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 18px 50px rgba(40,30,10,.25);
+}
+.modal-head { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+.modal-head h3 { margin: 0; font-size: 17px; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.toggle { display: flex; gap: 8px; flex-shrink: 0; }
+.toggle button {
+  font: inherit; font-size: 13px; padding: 5px 14px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--card); color: var(--muted); cursor: pointer;
+}
+.toggle button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.toggle button:disabled { opacity: .35; cursor: not-allowed; }
+.modal-close { border: none; background: none; font-size: 20px; line-height: 1;
+  cursor: pointer; color: var(--muted); padding: 4px 6px; flex-shrink: 0; }
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 6px 24px 24px; overflow-y: auto; }
+/* ---- 响应式 ---- */
+@media (max-width: 960px) {
+  main { grid-template-columns: 1fr; }
+  #sidebar { position: static; }
+  .grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>我的书架</h1>
+  <div id="stats">加载中……</div>
+</header>
+<noscript><div class="hint">这个面板需要 JavaScript 才能读取本地书架数据。</div></noscript>
+<main>
+  <section class="grid" id="books"></section>
+  <aside id="sidebar">
+    <section class="panel">
+      <h2>🪞 读者画像</h2>
+      <div class="body md" id="profile-body"></div>
+    </section>
+    <section class="panel">
+      <h2>📚 跨书记忆</h2>
+      <div class="body md" id="memory-body"></div>
+    </section>
+  </aside>
+</main>
+<div class="modal" id="modal" hidden>
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h3 id="modal-title"></h3>
+      <div class="toggle">
+        <button id="btn-mindmap">🧠 脑图</button>
+        <button id="btn-outline">📋 大纲</button>
+      </div>
+      <button class="modal-close" id="modal-close" title="关闭 (Esc)">✕</button>
+    </div>
+    <div class="modal-body md" id="modal-body"></div>
+  </div>
+</div>
+<script>
+'use strict';
+const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const $ = id => document.getElementById(id);
+
+let DATA = null;
+let currentBook = null;
+let currentType = 'mindmap';
+let noteSeq = 0;   // 快速切换时丢弃过期响应
+
+function renderMarkdown(el, text) {
+  if (window.marked && marked.parse) {
+    el.innerHTML = marked.parse(text);
+  } else {
+    el.innerHTML = '<div class="offline-hint">（离线模式：marked.js 未加载，纯文本显示）</div><pre>' + esc(text) + '</pre>';
+  }
+}
+
+function showFatal(msg) {
+  $('stats').textContent = '';
+  $('books').innerHTML = '<div class="hint">' + msg + '</div>';
+}
+
+function renderStats() {
+  const s = DATA.stats || {};
+  const bits = [(s.books ?? 0) + ' 本书', (s.notes ?? 0) + ' 份笔记'];
+  if (s.last_active) bits.push('最近更新 ' + s.last_active);
+  $('stats').textContent = bits.join(' · ');
+}
+
+function renderBooks() {
+  if (!DATA.books || !DATA.books.length) {
+    $('books').innerHTML = '<div class="hint">书架还空着 — 运行 <code>python agent.py</code> 聊一本书，笔记会自动出现在这里。</div>';
+    return;
+  }
+  $('books').innerHTML = DATA.books.map((b, i) =>
+    '<button class="card" data-i="' + i + '">' +
+      '<span class="card-title">' + esc(b.book) + '</span>' +
+      '<span class="card-author">' + esc(b.author || '佚名') + '</span>' +
+      '<span class="card-meta">' +
+        (b.mindmap ? '<span class="chip">🧠 脑图</span>' : '') +
+        (b.outline ? '<span class="chip">📋 大纲</span>' : '') +
+        '<span class="date">' + esc(b.updated_at || '') + '</span>' +
+      '</span>' +
+    '</button>').join('');
+}
+
+function renderSidebar() {
+  if (DATA.profile) renderMarkdown($('profile-body'), DATA.profile);
+  else $('profile-body').innerHTML = '<p class="placeholder">还没有画像 — 和读书搭子聊完一本书，这里会慢慢成形。</p>';
+  if (DATA.memory) renderMarkdown($('memory-body'), DATA.memory);
+  else $('memory-body').innerHTML = '<p class="placeholder">还没有跨书记忆。</p>';
+}
+
+/* ---------- 笔记弹窗 ---------- */
+function openBook(i) {
+  currentBook = DATA.books[i];
+  currentType = currentBook.mindmap ? 'mindmap' : 'outline';
+  $('modal-title').textContent = currentBook.author
+    ? '《' + currentBook.book + '》— ' + currentBook.author
+    : '《' + currentBook.book + '》';
+  syncToggle();
+  $('modal').hidden = false;
+  document.body.style.overflow = 'hidden';
+  loadNote();
+}
+
+function syncToggle() {
+  $('btn-mindmap').disabled = !currentBook.mindmap;
+  $('btn-outline').disabled = !currentBook.outline;
+  $('btn-mindmap').classList.toggle('active', currentType === 'mindmap');
+  $('btn-outline').classList.toggle('active', currentType === 'outline');
+}
+
+async function loadNote() {
+  const seq = ++noteSeq;
+  const body = $('modal-body');
+  body.innerHTML = '<p class="placeholder">加载中……</p>';
+  const url = '/api/note?book=' + encodeURIComponent(currentBook.book) +
+              '&author=' + encodeURIComponent(currentBook.author || '') +
+              '&type=' + currentType;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { msg = (await r.json()).error || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const text = await r.text();
+    if (seq !== noteSeq) return;
+    if (!text.trim()) throw new Error('笔记内容为空');
+    renderMarkdown(body, text);
+  } catch (e) {
+    if (seq !== noteSeq) return;
+    body.innerHTML = '<div class="hint">笔记加载失败：' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+function closeModal() {
+  $('modal').hidden = true;
+  document.body.style.overflow = '';
+}
+
+/* ---------- 事件 ---------- */
+$('books').addEventListener('click', e => {
+  const card = e.target.closest('.card');
+  if (card) openBook(Number(card.dataset.i));
+});
+$('btn-mindmap').addEventListener('click', () => { currentType = 'mindmap'; syncToggle(); loadNote(); });
+$('btn-outline').addEventListener('click', () => { currentType = 'outline'; syncToggle(); loadNote(); });
+$('modal-close').addEventListener('click', closeModal);
+$('modal').addEventListener('click', e => { if (e.target === $('modal')) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('modal').hidden) closeModal(); });
+
+/* ---------- 启动 ---------- */
+(async function init() {
+  try {
+    const r = await fetch('/api/shelf-data.json');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    DATA = await r.json();
+  } catch (e) {
+    showFatal('未连接到本地服务 — 请先运行 <code>python shelf.py</code>，再刷新本页。' +
+              '<br><small>(' + esc(e.message || String(e)) + ')</small>');
+    return;
+  }
+  renderStats();
+  renderBooks();
+  renderSidebar();
+})();
+</script>
+</body>
+</html>
