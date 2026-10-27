@@ -33,35 +33,36 @@ Most note-taking tools ask you to fill in fields. This one deliberately does not
 - 💬 Conversational reading experience: multi-turn dialogue, not one-shot Q&A
 - 🧠 Session save & memory recovery: it remembers where you left off
 - 📝 Auto-generated dual-format notes: Mermaid mindmap + Mubu outline after each session
-- 🤖 Multi-model backend: Anthropic Claude / DeepSeek (OpenAI-compatible), switch via `/model` at runtime
+- 🤖 Multi-model backend: any OpenAI-compatible service (DeepSeek / GLM / Kimi / Qwen / local Ollama …) or Anthropic native — switch via `/model` and `/config` at runtime
 - 📖 Book title + author dual-field input: avoids same-title mix-ups, smart author background lookup
-- ⚙️ Flexible key config: `--api-key` argument or local config file
+- ⚙️ Flexible key config: env vars / `config.json` (template: `config.example.json`) / `--api-key` argument
 
 ## Examples
 
-The `notes/` directory contains real generated notes for two books:
+The `notes/` directory contains real generated notes for four books:
 
 | Book | Author | Notes |
 |------|--------|-------|
 | Wives and Concubines (妻妾成群) | Su Tong | mindmap + Mubu import |
 | The Roaring Cycles (涛动周期论) | Zhou Jintao | mindmap + Mubu import |
+| 1984 | George Orwell | mindmap + Mubu import |
+| The Temple of Earth and I (我与地坛) | Shi Tiesheng | mindmap + Mubu import |
 
 ## Quick Start
 
 ```bash
-python agent.py                                   # auto-detect key type
-python agent.py --provider deepseek               # force DeepSeek
-python agent.py --provider anthropic              # force Anthropic
-python agent.py --api-key sk-xxx --model deepseek-chat
+python agent.py                                   # config from env vars / config.json
+python agent.py --protocol anthropic              # force Anthropic native protocol
+python agent.py --api-key sk-xxx --base-url https://api.deepseek.com --model deepseek-chat
 python agent.py --reset-config
 ```
 
-After first run, the key is stored locally in `.reading_buddy_config.json` (excluded by `.gitignore`, never uploaded).
+The key lives in local `config.json` — copy `config.example.json` and fill in `api_key` / `base_url` / `model` (excluded by `.gitignore`, never uploaded). Env vars (`OPENAI_API_KEY` etc.) take priority when set.
 
 ## Tech Stack
 
 - Python 3 (standard library)
-- Anthropic Claude API / DeepSeek API (OpenAI-compatible)
+- Any OpenAI-compatible API (DeepSeek / GLM / Kimi / Qwen / Ollama …) or Anthropic native
 - Mermaid mindmap syntax
 
 ## Development

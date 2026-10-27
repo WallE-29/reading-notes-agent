@@ -7,22 +7,30 @@
   - notes/<书名>_幕布导入版.md   → Tab 缩进层级大纲,可直接导入幕布/Xmind 一键生成脑图
 
 功能:
-  - 多模型后端支持: Anthropic Claude / DeepSeek (OpenAI 兼容接口)
+  - 通用模型接入: 任何 OpenAI 兼容服务 (DeepSeek / OpenAI / 智谱GLM / Kimi / 通义 / 本地Ollama 等),
+    另支持 Anthropic 原生协议
   - API Key 本地持久化
   - 书名 + 作者双字段录入,防同名书混淆
   - 智能作者背景检索
   - 会话存档 & 记忆恢复
-  - 运行时切换模型 (/model 命令)
+  - 运行时切换模型 (/model 命令) 与切换服务 (/config 命令: base_url / api_key / 模型)
   - 跨书记忆 memory.md: 会话结束时提炼读书偏好,追加写入,所有书共享
     (Ctrl+C / 关窗口 / 崩溃等异常退出后,下次启动自动补做提炼,记忆不丢)
   - 读者画像 profile.md: 首次启动问答建档,之后以文艺笔触持续更新
 
+配置优先级: 环境变量 > config.json > .reading_buddy_config.json (老版本兼容)
+
 Usage:
-    python agent.py                                    # 自动检测 Key 类型
-    python agent.py --provider deepseek                # 强制使用 DeepSeek
-    python agent.py --provider anthropic               # 强制使用 Anthropic
-    python agent.py --api-key sk-xxx --model deepseek-chat
+    python agent.py                                    # 配置来自环境变量 / config.json
+    python agent.py --protocol anthropic               # 强制 Anthropic 原生协议
+    python agent.py --api-key sk-xxx --base-url https://api.deepseek.com --model deepseek-chat
     python agent.py --reset-config
+    python agent.py --list-sessions
+
+环境变量 (最高优先级):
+    OPENAI_API_KEY    (+可选 OPENAI_BASE_URL / OPENAI_MODEL)  → 任何 OpenAI 兼容服务
+    DEEPSEEK_API_KEY                                  → DeepSeek (base_url 自动填)
+    ANTHROPIC_API_KEY (+可选 ANTHROPIC_MODEL)          → Anthropic 原生
 """
 
 from __future__ import annotations
@@ -34,8 +42,10 @@ import json
 import time
 import argparse
 import textwrap
+import getpass
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from typing import Optional, Literal
 
 # --- Windows UTF-8 ---
@@ -78,70 +88,286 @@ if not Style.supports_color():
 PROJECT_DIR    = Path(__file__).resolve().parent
 NOTES_DIR      = PROJECT_DIR / "notes"
 SESSIONS_DIR   = PROJECT_DIR / "sessions"
-CONFIG_FILE    = PROJECT_DIR / ".reading_buddy_config.json"
+CONFIG_FILE        = PROJECT_DIR / "config.json"                    # 现行配置文件
+LEGACY_CONFIG_FILE = PROJECT_DIR / ".reading_buddy_config.json"     # 老配置, 兼容只读
 KNOWN_FLAG     = "KNOWN"
 UNKNOWN_FLAG   = "UNKNOWN"
 
 # ---------------------------------------------------------------------------
-# 后端信息表
+# 协议与常见服务注册表
 # ---------------------------------------------------------------------------
-PROVIDER_INFO = {
-    "anthropic": {
-        "name": "Anthropic Claude",
-        "default_model": "claude-sonnet-4-6-20250701",
-        "default_base_url": None,  # 用 SDK 默认
-        "models": [
-            ("claude-sonnet-4-6-20250701", "Sonnet 4.6 — 推荐, 均衡"),
-            ("claude-opus-4-8",             "Opus 4.8 — 最强推理"),
-            ("claude-haiku-4-5-20251001",   "Haiku 4.5 — 更快更便宜"),
-        ],
-    },
+# 协议分两类:
+#   openai_compatible — 走 openai 库, 传 base_url + model, 通吃绝大多数服务
+#   anthropic         — Claude 原生 SDK (官方格式特殊, 单独保留)
+PROTOCOL_LABELS = {
+    "openai_compatible": "OpenAI 兼容",
+    "anthropic":         "Anthropic 原生",
+}
+
+# 常见 OpenAI 兼容服务: 用于无配置引导、默认模型与 /model 建议;
+# 表外的服务只要填 api_key + base_url + model 三要素即可接入
+KNOWN_SERVICES = {
     "deepseek": {
         "name": "DeepSeek",
+        "protocol": "openai_compatible",
+        "base_url": "https://api.deepseek.com",
         "default_model": "deepseek-chat",
-        "default_base_url": "https://api.deepseek.com",
+        "hosts": ["api.deepseek.com"],
         "models": [
             ("deepseek-chat",     "DeepSeek-V3 — 推荐, 综合能力强"),
             ("deepseek-reasoner", "DeepSeek-R1 — 推理增强"),
         ],
     },
+    "openai": {
+        "name": "OpenAI",
+        "protocol": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "default_model": "gpt-4o",
+        "hosts": ["api.openai.com"],
+        "models": [
+            ("gpt-4o",      "GPT-4o — 均衡之选"),
+            ("gpt-4o-mini", "GPT-4o mini — 更快更便宜"),
+        ],
+    },
+    "zhipu": {
+        "name": "智谱 GLM",
+        "protocol": "openai_compatible",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "default_model": None,   # 模型名迭代快, 请按官方文档填写
+        "hosts": ["open.bigmodel.cn"],
+        "models": [
+            ("glm-4.5",     "GLM-4.5 — 旗舰"),
+            ("glm-4.5-air", "GLM-4.5-Air — 轻量"),
+            ("glm-4-flash", "GLM-4-Flash — 免费"),
+        ],
+    },
+    "kimi": {
+        "name": "Kimi",
+        "protocol": "openai_compatible",
+        "base_url": "https://api.moonshot.cn/v1",
+        "default_model": None,
+        "hosts": ["api.moonshot.cn"],
+        "models": [
+            ("kimi-k2-0905-preview", "Kimi K2 — 旗舰"),
+            ("moonshot-v1-128k",     "Moonshot V1 — 长上下文"),
+        ],
+    },
+    "qwen": {
+        "name": "通义千问",
+        "protocol": "openai_compatible",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "default_model": None,
+        "hosts": ["dashscope.aliyuncs.com"],
+        "models": [
+            ("qwen-plus",  "Qwen-Plus — 推荐, 均衡"),
+            ("qwen-max",   "Qwen-Max — 能力最强"),
+            ("qwen-turbo", "Qwen-Turbo — 更快更便宜"),
+        ],
+    },
+    "ollama": {
+        "name": "本地 Ollama",
+        "protocol": "openai_compatible",
+        "base_url": "http://localhost:11434/v1",
+        "default_model": None,   # 视本地已拉取的模型而定, 如 qwen2.5:7b
+        "hosts": ["localhost", "127.0.0.1"],
+        "models": [],
+    },
+    "anthropic": {
+        "name": "Anthropic Claude",
+        "protocol": "anthropic",
+        "base_url": None,       # 用 SDK 默认
+        "default_model": "claude-sonnet-5",
+        "hosts": ["api.anthropic.com"],
+        "models": [
+            ("claude-sonnet-5",  "Sonnet 5 — 推荐, 均衡"),
+            ("claude-opus-5",    "Opus 5 — 最强推理"),
+            ("claude-haiku-4-5", "Haiku 4.5 — 更快更便宜"),
+        ],
+    },
 }
 
+# /config 服务选择菜单的顺序 (anthropic 走原生协议, 不在此菜单; 可经 [7] 自定义接入)
+CONFIG_SERVICE_KEYS = ("deepseek", "openai", "zhipu", "kimi", "qwen", "ollama")
 
-def detect_provider(api_key: str) -> str:
-    """根据 API Key 前缀自动检测后端。sk-ant- → anthropic; 其他 → deepseek。"""
+
+def detect_protocol(api_key: str) -> str:
+    """根据 API Key 前缀判断协议。sk-ant- → anthropic; 其他 → openai_compatible。"""
     if api_key.startswith("sk-ant-"):
         return "anthropic"
-    return "deepseek"
+    return "openai_compatible"
+
+
+def find_service(base_url: str) -> Optional[str]:
+    """按 base_url 域名识别已知服务; 返回 KNOWN_SERVICES 的 key 或 None。"""
+    if not base_url:
+        return None
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for key, info in KNOWN_SERVICES.items():
+        if any(host == h or host.endswith("." + h) for h in info["hosts"]):
+            return key
+    return None
+
+
+def is_local_url(base_url: Optional[str]) -> bool:
+    """base_url 是否指向本机 (本地 Ollama 等无需真实 Key)。"""
+    if not base_url:
+        return False
+    try:
+        host = (urlparse(base_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
 
 
 # ---------------------------------------------------------------------------
-# 配置文件
+# 配置: 环境变量 > config.json > .reading_buddy_config.json (老版本)
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
     "api_key": "",
-    "provider": "auto",      # "auto" | "anthropic" | "deepseek"
-    "model": "",             # 空 = 使用 provider 默认
+    "protocol": "auto",      # "auto" | "openai_compatible" | "anthropic"
+    "model": "",             # 空 = 使用对应已知服务的默认模型
     "mindmap_model": None,
     "base_url": None,
 }
 
 
+def read_config_file() -> tuple[Optional[dict], str]:
+    """读取配置文件 (config.json 优先, 老文件兼容); 返回 (原始dict或None, 文件名)。"""
+    for path in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+        if not path.exists():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw, path.name
+            print(f"  {Style.YELLOW}[!] {path.name} 内容格式异常, 已跳过{Style.RESET}")
+        except Exception as e:
+            print(f"  {Style.YELLOW}[!] 读取 {path.name} 失败 ({e}){Style.RESET}")
+    return None, ""
+
+
+def normalize_config(raw: dict) -> dict:
+    """把任意版本的配置统一成新 schema; 老版 provider 字段兼容映射。"""
+    cfg = {**DEFAULT_CONFIG, **{k: raw[k] for k in DEFAULT_CONFIG if k in raw}}
+    if "protocol" not in raw and raw.get("provider"):
+        provider = str(raw["provider"]).lower()
+        if provider == "anthropic":
+            cfg["protocol"] = "anthropic"
+        elif provider == "deepseek":
+            cfg["protocol"] = "openai_compatible"
+            cfg["base_url"] = cfg.get("base_url") or KNOWN_SERVICES["deepseek"]["base_url"]
+        # "auto" 保持 "auto", 之后再按 Key 前缀判断
+    return cfg
+
+
 def load_config() -> dict:
-    try:
-        if CONFIG_FILE.exists():
-            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            return {**DEFAULT_CONFIG, **cfg}
-    except Exception as e:
-        print(f"  {Style.YELLOW}[!] 读取配置失败 ({e}){Style.RESET}")
-    return dict(DEFAULT_CONFIG)
+    """读取并归一化配置文件 (无文件时返回默认值)。"""
+    raw, _ = read_config_file()
+    return normalize_config(raw) if raw else dict(DEFAULT_CONFIG)
 
 
 def save_config(config: dict) -> None:
+    """保存配置到 config.json (老文件不再写入, 仅兼容读取)。"""
     try:
         CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"  {Style.RED}[!] 保存配置失败: {e}{Style.RESET}")
+
+
+def config_from_env() -> tuple[Optional[dict], str]:
+    """从环境变量提取配置; 返回 (配置片段, 来源说明) 或 (None, "")。
+
+    优先级 OPENAI_API_KEY > DEEPSEEK_API_KEY > ANTHROPIC_API_KEY;
+    片段自带完整默认值, 不与文件配置逐字段合并。
+    """
+    def env(name: str) -> str:
+        return os.environ.get(name, "").strip()
+
+    if env("OPENAI_API_KEY"):
+        base_url = env("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        model = env("OPENAI_MODEL")
+        if not model:
+            # base_url 指向其他已知服务 → 借用该服务的默认模型
+            svc = KNOWN_SERVICES.get(find_service(base_url))
+            model = (svc or {}).get("default_model") or ""
+        return {
+            "api_key": env("OPENAI_API_KEY"),
+            "protocol": "openai_compatible",
+            "base_url": base_url,
+            "model": model,
+        }, "环境变量 OPENAI_API_KEY"
+
+    if env("DEEPSEEK_API_KEY"):
+        return {
+            "api_key": env("DEEPSEEK_API_KEY"),
+            "protocol": "openai_compatible",
+            "base_url": KNOWN_SERVICES["deepseek"]["base_url"],
+            "model": "deepseek-chat",
+        }, "环境变量 DEEPSEEK_API_KEY"
+
+    if env("ANTHROPIC_API_KEY"):
+        return {
+            "api_key": env("ANTHROPIC_API_KEY"),
+            "protocol": "anthropic",
+            "base_url": None,
+            "model": env("ANTHROPIC_MODEL") or "claude-sonnet-5",
+        }, "环境变量 ANTHROPIC_API_KEY"
+
+    return None, ""
+
+
+def _display_width(s: str) -> int:
+    """近似终端显示宽度 (中文算两列), 用于引导表格对齐。"""
+    return sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+
+
+def print_setup_guide(reason: str) -> None:
+    """没有配置时: 打印友好的中文指引后直接退出, 不抛异常堆栈。(不返回)"""
+    print()
+    print(f"  {Style.YELLOW}[!] {reason}{Style.RESET}")
+    print()
+    print(f"  {Style.BOLD}两种配置方式, 任选其一:{Style.RESET}")
+    print()
+    print(f"  {Style.CYAN}方式一 · 设置环境变量{Style.RESET}")
+    print(f"     {Style.DIM}Windows PowerShell:{Style.RESET}")
+    print( "       $env:OPENAI_API_KEY=\"sk-xxx\"; python agent.py")
+    print(f"     {Style.DIM}macOS / Linux:{Style.RESET}")
+    print( "       export OPENAI_API_KEY=sk-xxx && python agent.py")
+    print(f"     {Style.DIM}可选: OPENAI_BASE_URL / OPENAI_MODEL; 也支持 DEEPSEEK_API_KEY、ANTHROPIC_API_KEY{Style.RESET}")
+    print()
+    print(f"  {Style.CYAN}方式二 · 使用配置文件{Style.RESET}")
+    print(f"     复制 config.example.json 为 config.json, 填入三要素:")
+    print(f"       api_key    你的 API Key")
+    print(f"       base_url   服务地址 (见下表)")
+    print(f"       model      模型名")
+    print()
+    print(f"  {Style.BOLD}常见服务 base_url 对照表:{Style.RESET}")
+    for svc in KNOWN_SERVICES.values():
+        if svc["protocol"] != "openai_compatible" or not svc["base_url"]:
+            continue
+        pad = " " * max(2, 16 - _display_width(svc["name"]))
+        print(f"     {svc['name']}{pad}{svc['base_url']}")
+    print(f"     {Style.DIM}(Anthropic 用户把 protocol 填为 anthropic; 本地 Ollama 无需真实 Key, api_key 随便填){Style.RESET}")
+    print()
+    sys.exit(1)
+
+
+def print_model_guide(base_url: Optional[str]) -> None:
+    """无法推断默认模型时: 提示填写模型名后退出。(不返回)"""
+    print()
+    print(f"  {Style.YELLOW}[!] 无法确定该服务的默认模型, 请显式指定模型名{Style.RESET}")
+    print(f"  {Style.DIM}  当前 API 地址: {base_url or '默认'}{Style.RESET}")
+    print()
+    print(f"  两种方式任选其一:")
+    print(f"    1. 在 config.json 中填写 model 字段 (查该服务官方文档; Ollama 填本地已拉取的模型名, 如 qwen2.5:7b)")
+    print(f"    2. 设置环境变量 OPENAI_MODEL, 如 $env:OPENAI_MODEL=\"模型名\"")
+    print()
+    sys.exit(1)
 
 
 def obfuscate_key(api_key: str) -> str:
@@ -204,7 +430,7 @@ def list_all_sessions() -> list[dict]:
                 "mode": d.get("mode", "unknown"),
                 "updated_at": d.get("updated_at", ""),
                 "model": d.get("model", "unknown"),
-                "provider": d.get("provider", ""),
+                "backend": d.get("protocol") or d.get("provider", ""),
             })
         except Exception:
             pass
@@ -501,41 +727,28 @@ class ReadingBuddyAgent:
     def __init__(
         self,
         api_key: str,
-        provider: str = "auto",
-        model: Optional[str] = None,
+        protocol: str = "openai_compatible",
+        model: str = "",
         mindmap_model: Optional[str] = None,
         base_url: Optional[str] = None,
+        config_from_env: bool = False,
     ):
-        # --- 确定后端 ---
-        if provider == "auto":
-            provider = detect_provider(api_key)
-        self.provider = provider
-        info = PROVIDER_INFO[provider]
-
-        # 模型
-        self.model = model or info["default_model"]
+        # --- 确定协议 ---
+        if protocol not in PROTOCOL_LABELS:
+            protocol = detect_protocol(api_key)
+        self.protocol = protocol
+        self.base_url = base_url
+        self.model = model
         self.mindmap_model = mindmap_model or self.model
+        self._config_from_env = config_from_env   # 配置来自环境变量时, /model 切换不落盘
 
-        # base_url
-        if base_url:
-            self.base_url = base_url
-        else:
-            self.base_url = info["default_base_url"]
+        # 已知服务识别 (用于显示与 /model 建议)
+        self.service_key = "anthropic" if protocol == "anthropic" else find_service(base_url or "")
+        self.service_label = KNOWN_SERVICES[self.service_key]["name"] if self.service_key else "自定义服务"
 
         # --- 创建客户端 ---
-        if provider == "anthropic":
-            import anthropic
-            kwargs = {"api_key": api_key}
-            if self.base_url:
-                kwargs["base_url"] = self.base_url
-            self._client = anthropic.Anthropic(**kwargs)
-        else:
-            # OpenAI 兼容 (DeepSeek / 其他)
-            import openai
-            self._client = openai.OpenAI(
-                api_key=api_key,
-                base_url=self.base_url or "https://api.deepseek.com",
-            )
+        self._api_key = api_key
+        self._client = self._create_client(api_key, protocol, base_url)
 
         # 会话状态
         self.book_name: str = ""
@@ -544,6 +757,24 @@ class ReadingBuddyAgent:
         self.mode: Literal["known", "unknown"] = "unknown"
         self.messages: list[dict] = []
         self.system_prompt: str = ""
+
+    # ------------------------------------------------------------------
+    # 客户端构建 (/config 切换服务后重建)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _create_client(api_key: str, protocol: str, base_url: Optional[str]):
+        if protocol == "anthropic":
+            import anthropic
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            return anthropic.Anthropic(**kwargs)
+        # OpenAI 兼容: 传 base_url + model 通吃绝大多数服务
+        import openai
+        return openai.OpenAI(
+            api_key=api_key,
+            base_url=base_url or "https://api.deepseek.com",   # 兜底同老版本行为
+        )
 
     # ------------------------------------------------------------------
     # 后端无关的 API 封装
@@ -560,7 +791,7 @@ class ReadingBuddyAgent:
         """非流式 API 调用,返回完整文本。"""
         model = model or self.model
 
-        if self.provider == "anthropic":
+        if self.protocol == "anthropic":
             resp = self._client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
@@ -592,7 +823,7 @@ class ReadingBuddyAgent:
         """流式 API 调用,生成器产出文本增量。"""
         model = model or self.model
 
-        if self.provider == "anthropic":
+        if self.protocol == "anthropic":
             with self._client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
@@ -769,11 +1000,22 @@ class ReadingBuddyAgent:
             sections.append("### 跨书记忆 (memory.md)\n\n" + memory)
         if not sections:
             return ""
+        guidance = textwrap.dedent("""\
+            以上是你和这位读者跨书相处的记录。请这样使用它：
+
+            - **如果当前共读的书与记忆中的某本书属于同一作者，或题材/风格明显相近**：
+              请在开场自然地提一句关联（例如"你上次读《XX》时特别关注……，这本在某些地方也有类似的质地"），
+              让读者感到被记住。全程最多提一次，点到为止。
+
+            - **如果当前的书是全新的作者、且题材与记忆中任何一本都相差很远**：
+              不必强行关联，像第一次认识一样自然地进入这本书即可。宁可不说，也不要硬扯。
+
+            - 无论哪种情况：不要机械复述记忆内容、不要罗列条目、不要对读者的品味评头论足。""")
         return (
             "## 关于这位读者 (跨书信息)\n\n"
             + "\n\n".join(sections)
-            + "\n\n以上是你和这位读者跨书相处的记录。像老朋友记得对方的口味那样自然地用起来:"
-              "聊到相关的作品或角度时可以顺势提起,但不要机械复述、不要罗列,更不要评头论足。"
+            + "\n\n"
+            + guidance
         )
 
     # ------------------------------------------------------------------
@@ -895,6 +1137,9 @@ class ReadingBuddyAgent:
         if s.lower().startswith("/model"):
             self._cmd_model(s)
             return "command_handled"
+        if s.lower() in ("/config", "/service"):
+            self._cmd_config()
+            return "command_handled"
         if s.lower().startswith("/save"):
             self._cmd_save()
             return "command_handled"
@@ -942,8 +1187,12 @@ class ReadingBuddyAgent:
                 print(f"  {Style.DIM}  1. API Key 无效/过期 → python agent.py --reset-config{Style.RESET}")
                 print(f"  {Style.DIM}  2. 模型权限不足 → /model 换一个模型试试{Style.RESET}")
                 print(f"  {Style.DIM}  3. 余额/额度用尽{Style.RESET}")
-                print(f"  {Style.DIM}  4. 当前后端: {PROVIDER_INFO[self.provider]['name']}, base_url: {self.base_url or '默认'}{Style.RESET}")
+                print(f"  {Style.DIM}  4. 当前服务: {self.service_label}, base_url: {self.base_url or '默认'}{Style.RESET}")
                 print(f"  {Style.RED}原始错误: {e}{Style.RESET}\n")
+            elif "401" in str(e):
+                print(f"\n  {Style.RED}[!] API 鉴权失败 (401): Key 无效或已过期{Style.RESET}")
+                print(f"  {Style.DIM}  当前服务: {self.service_label} · base_url: {self.base_url or '默认'}{Style.RESET}")
+                print(f"  {Style.DIM}  → 用 /config 重新填写该服务的 API Key (注意粘贴一次即可, 长度约几十字符){Style.RESET}\n")
             else:
                 print(f"\n  {Style.RED}[!] 流式输出出错: {e}{Style.RESET}\n")
             full = f"(AI 回复生成失败: {e})"
@@ -1047,6 +1296,7 @@ class ReadingBuddyAgent:
         返回 True 表示提炼流程执行完成 (含"无新信号"); False 表示跳过或失败。
         成功后把会话存档标记为 memory_extracted=true,供下次启动判断是否补提炼。"""
         if len(self.messages) < 4:
+            print_status("本次对话较短，未提炼跨书记忆（至少需要约 2 轮对话才能形成有效信号）", Style.DIM)
             self._mark_memory_extracted()  # 只有开场寒暄,无内容可提炼,同样标记完成
             return False
         label = format_book_label(self.book_name, self.author)
@@ -1120,30 +1370,31 @@ class ReadingBuddyAgent:
     # 命令
     # ------------------------------------------------------------------
     def _cmd_model(self, raw_input: str):
-        info = PROVIDER_INFO[self.provider]
+        service = KNOWN_SERVICES.get(self.service_key) if self.service_key else None
         parts = raw_input.strip().split(maxsplit=1)
         if len(parts) == 1:
             print()
-            print(f"  {Style.BLUE}当前后端: {Style.BOLD}{info['name']}{Style.RESET}")
+            print(f"  {Style.BLUE}当前服务: {Style.BOLD}{self.service_label}{Style.RESET}")
             print(f"  {Style.BLUE}当前对话模型: {Style.BOLD}{self.model}{Style.RESET}")
-            if self.mindmap_model:
+            if self.mindmap_model and self.mindmap_model != self.model:
                 print(f"  {Style.BLUE}当前脑图模型: {Style.BOLD}{self.mindmap_model}{Style.RESET}")
             else:
                 print(f"  {Style.DIM}(脑图模型与对话模型相同){Style.RESET}")
             print()
-            print(f"  {Style.DIM}可用模型:{Style.RESET}")
-            for mid, desc in info["models"]:
-                marker = " ← 当前" if mid == self.model else ""
-                print(f"     {Style.DIM}{mid}  ({desc}){marker}{Style.RESET}")
-            print()
-            print(f"  {Style.DIM}切换示例: /model {info['models'][0][0]}{Style.RESET}")
+            if service and service.get("models"):
+                print(f"  {Style.DIM}该服务常见模型 (任意模型名也可直接输入):{Style.RESET}")
+                for mid, desc in service["models"]:
+                    marker = " ← 当前" if mid == self.model else ""
+                    print(f"     {Style.DIM}{mid}  ({desc}){marker}{Style.RESET}")
+                print()
+                print(f"  {Style.DIM}切换示例: /model {service['models'][0][0]}{Style.RESET}")
+            else:
+                print(f"  {Style.DIM}该服务的模型名以其官方文档为准:{Style.RESET}")
+                print(f"  {Style.DIM}切换示例: /model <模型名>{Style.RESET}")
             print()
         else:
             new_model = parts[1].strip()
-            valid_models = [m[0] for m in info["models"]]
-            if new_model not in valid_models:
-                print(f"  {Style.YELLOW}[!] 未知模型 '{new_model}', 可用: {', '.join(valid_models)}{Style.RESET}")
-                print()
+            if not new_model:
                 return
             old = self.model
             self.model = new_model
@@ -1151,11 +1402,102 @@ class ReadingBuddyAgent:
             print(f"  {Style.GREEN}[OK] 模型已切换:{Style.RESET}")
             print(f"  {Style.DIM}  {old}{Style.RESET}")
             print(f"  {Style.DIM}  → {Style.BOLD}{self.model}{Style.RESET}")
+            if self._config_from_env:
+                print(f"  {Style.YELLOW}[!] 当前配置来自环境变量, 此切换仅本次会话生效{Style.RESET}")
+            else:
+                cfg = load_config()
+                cfg["model"] = self.model
+                save_config(cfg)
             print()
-            cfg = load_config()
-            cfg["model"] = self.model
-            save_config(cfg)
+            print(f"  {Style.DIM}提示: 如果切换到的是其他服务 (如从 DeepSeek 换到智谱), 请用 /config 同时更新 base_url 和 api_key。{Style.RESET}")
+            print()
             self._do_save_session()
+
+    def _cmd_config(self):
+        """交互式重配连接三要素 (base_url / api_key / 模型), 保存到 config.json 并即时生效。"""
+        print()
+        print(f"  {Style.BLUE}{Style.BOLD}当前配置:{Style.RESET}")
+        print(f"  {Style.DIM}  服务: {self.service_label}{Style.RESET}")
+        print(f"  {Style.DIM}  base_url: {self.base_url or '(SDK 默认)'}{Style.RESET}")
+        print(f"  {Style.DIM}  模型: {self.model}{Style.RESET}")
+        print(f"  {Style.DIM}  API Key: {obfuscate_key(self._api_key) if self._api_key else '(未设置)'}{Style.RESET}")
+        print()
+        print(f"  {Style.BLUE}选择服务:{Style.RESET}")
+        for i, key in enumerate(CONFIG_SERVICE_KEYS, 1):
+            svc = KNOWN_SERVICES[key]
+            pad = " " * max(2, 14 - _display_width(svc["name"]))
+            print(f"  {Style.CYAN}[{i}]{Style.RESET} {svc['name']}{pad}{Style.DIM}{svc['base_url']}{Style.RESET}")
+        print(f"  {Style.CYAN}[7]{Style.RESET} 自定义 base_url")
+        print(f"  {Style.DIM}(回车 = 不切换服务, 只改 base_url / Key / 模型){Style.RESET}")
+        choice = input(f"  {Style.CYAN}选择 (1-7):{Style.RESET} ").strip()
+        print()
+
+        protocol, base_url = self.protocol, self.base_url
+        if choice.isdigit() and 1 <= int(choice) <= len(CONFIG_SERVICE_KEYS):
+            svc = KNOWN_SERVICES[CONFIG_SERVICE_KEYS[int(choice) - 1]]
+            protocol, base_url = svc["protocol"], svc["base_url"]
+            new_url = input(f"  {Style.CYAN}base_url{Style.RESET} {Style.DIM}(回车 = {base_url}):{Style.RESET} ").strip()
+            if new_url:
+                base_url = new_url
+        elif choice == "7":
+            new_url = input(f"  {Style.CYAN}自定义 base_url (回车 = 保留当前):{Style.RESET} ").strip()
+            if new_url:
+                base_url = new_url
+
+        api_key = self._api_key
+        while True:
+            new_key = getpass.getpass("  API Key (输入不回显, 回车 = 保留当前): ").strip()
+            if not new_key:
+                break
+            # 显示长度供确认: 无回显下连续粘贴会把多份 Key 拼成一行, 长度一眼可辨
+            print(f"  {Style.DIM}已收到: {obfuscate_key(new_key)} ({len(new_key)} 字符){Style.RESET}")
+            if input("  回车确认 / r 重新粘贴: ").strip().lower() != "r":
+                api_key = new_key
+                break
+
+        model = self.model
+        new_service = KNOWN_SERVICES.get("anthropic" if protocol == "anthropic" else find_service(base_url or ""))
+        if new_service and new_service.get("models"):
+            suggestions = "  ".join(f"{mid} ({desc})" for mid, desc in new_service["models"])
+            print(f"  {Style.DIM}该服务常见模型: {suggestions}{Style.RESET}")
+        new_model = input(f"  {Style.CYAN}模型名 (回车 = 保留当前 {model}):{Style.RESET} ").strip()
+        if new_model:
+            model = new_model
+
+        # 全部回车 = 只查看, 不落盘 (避免把环境变量快照意外写进 config.json)
+        if (protocol, base_url, api_key, model) == (self.protocol, self.base_url, self._api_key, self.model):
+            print()
+            print(f"  {Style.DIM}配置未变化, 已保留 {CONFIG_FILE.name} 原内容{Style.RESET}")
+            print()
+            return
+
+        # --- 保存 (mindmap_model 跟随主模型时一并切换) ---
+        old_model = self.model
+        cfg = load_config()
+        cfg.update({"api_key": api_key, "protocol": protocol, "base_url": base_url, "model": model})
+        if not cfg.get("mindmap_model") or cfg["mindmap_model"] == old_model:
+            cfg["mindmap_model"] = model
+        save_config(cfg)
+
+        # --- 即时生效: 更新自身状态并重建客户端 ---
+        self.protocol, self.base_url, self.model = protocol, base_url, model
+        if not self.mindmap_model or self.mindmap_model == old_model:
+            self.mindmap_model = model
+        self._api_key = api_key
+        self.service_key = "anthropic" if protocol == "anthropic" else find_service(base_url or "")
+        self.service_label = KNOWN_SERVICES[self.service_key]["name"] if self.service_key else "自定义服务"
+        self._client = self._create_client(api_key, protocol, base_url)
+
+        print()
+        print(f"  {Style.GREEN}[OK] 新配置已保存到 {CONFIG_FILE.name}, 并已即时生效:{Style.RESET}")
+        print(f"  {Style.DIM}  服务: {self.service_label}{Style.RESET}")
+        print(f"  {Style.DIM}  base_url: {self.base_url or '(SDK 默认)'}{Style.RESET}")
+        print(f"  {Style.DIM}  模型: {self.model}{Style.RESET}")
+        print(f"  {Style.DIM}  API Key: {obfuscate_key(api_key)}{Style.RESET}")
+        if self._config_from_env:
+            print(f"  {Style.YELLOW}[!] 当前运行配置来自环境变量, 环境变量优先 — 此修改会在未设置环境变量时生效{Style.RESET}")
+        print()
+        self._do_save_session()
 
     def _cmd_save(self):
         self._do_save_session()
@@ -1218,15 +1560,15 @@ class ReadingBuddyAgent:
             cur_label = format_book_label(self.book_name, self.author)
             marker = " ← 当前" if label == cur_label else ""
             print(f"  {Style.CYAN}{i}.{Style.RESET} {icon} {Style.BOLD}{label}{Style.RESET}{marker}")
-            print(f"     {Style.DIM}{s['message_count']} 条 · {format_datetime(s['updated_at'])} · {s.get('provider','')} · {s['model']}{Style.RESET}")
+            print(f"     {Style.DIM}{s['message_count']} 条 · {format_datetime(s['updated_at'])} · {s.get('backend','')} · {s['model']}{Style.RESET}")
         print()
 
     def _cmd_help(self):
-        info = PROVIDER_INFO[self.provider]
         print()
-        print(f"  {Style.BLUE}{Style.BOLD}可用命令 ({info['name']} 后端):{Style.RESET}")
+        print(f"  {Style.BLUE}{Style.BOLD}可用命令 ({self.service_label} · {PROTOCOL_LABELS[self.protocol]}):{Style.RESET}")
         print()
         print(f"  {Style.CYAN}/model [模型名]{Style.RESET}  — 查看或切换模型")
+        print(f"  {Style.CYAN}/config, /service{Style.RESET} — 切换服务 (base_url / API Key / 模型)")
         print(f"  {Style.CYAN}/author{Style.RESET}          — 查看作者背景信息")
         print(f"  {Style.CYAN}/profile, /me{Style.RESET}    — 查看读者画像 & 跨书记忆")
         print(f"  {Style.CYAN}/save{Style.RESET}            — 手动存档")
@@ -1244,7 +1586,8 @@ class ReadingBuddyAgent:
             "author": self.author,
             "author_info": self.author_info,
             "mode": self.mode,
-            "provider": self.provider,
+            "protocol": self.protocol,
+            "service": self.service_label,
             "model": self.model,
             "mindmap_model": self.mindmap_model,
             "base_url": self.base_url,
@@ -1259,6 +1602,32 @@ class ReadingBuddyAgent:
         self._session_updated_at = data["updated_at"]
 
     # ------------------------------------------------------------------
+    # 书名输入确认
+    # ------------------------------------------------------------------
+    def _confirm_book_input(self, book_name: str, author: str) -> Literal["confirm", "redo", "quit"]:
+        """书名/作者确认关卡: 展示即将共读的书与存档提示,循环等待直到确认或退出。
+
+        回车 → confirm;r/R → redo (重新输入);q/Q → quit (退出);其他输入提示后重试。
+        """
+        label = format_book_label(book_name, author)
+        has_previous = load_session(book_name, author) is not None
+        print()
+        print(f"  {Style.CYAN}{Style.BOLD}即将开始共读：{label}{Style.RESET}")
+        if has_previous:
+            print(f"  {Style.DIM}（检测到之前聊过这本书，继续会话接上历史记录）{Style.RESET}")
+        print()
+        print(f"  {Style.GREEN}[回车]{Style.RESET} 确认开始   {Style.YELLOW}[r]{Style.RESET} 重新输入   {Style.DIM}[q]{Style.RESET} 退出")
+        while True:
+            choice = input(f"  {Style.CYAN}请确认:{Style.RESET} ").strip().lower()
+            if choice == "":
+                return "confirm"
+            if choice == "r":
+                return "redo"
+            if choice == "q":
+                return "quit"
+            print(f"  {Style.YELLOW}请输入回车/r/q{Style.RESET}")
+
+    # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
     def run(self):
@@ -1268,15 +1637,29 @@ class ReadingBuddyAgent:
         if PROFILE_FILE.exists() or MEMORY_FILE.exists():
             print_status("读者画像 & 跨书记忆已就绪 (/profile 可查看)", Style.DIM)
 
-        book_name = input(f"  {Style.CYAN}请输入你在读的书名:{Style.RESET} ").strip()
-        while not book_name:
-            print(f"  {Style.YELLOW}书名不能为空,请输入书名~{Style.RESET}")
+        # 书名 + 作者录入,过确认关卡 (回车确认 / r 重新输入 / q 退出),循环直到确认或退出
+        while True:
             book_name = input(f"  {Style.CYAN}请输入你在读的书名:{Style.RESET} ").strip()
+            while not book_name:
+                print(f"  {Style.YELLOW}书名不能为空,请输入书名~{Style.RESET}")
+                book_name = input(f"  {Style.CYAN}请输入你在读的书名:{Style.RESET} ").strip()
 
-        print()
-        author = input(f"  {Style.CYAN}请输入作者名 (可选,按回车跳过):{Style.RESET} ").strip()
-        if author:
-            print(f"  {Style.DIM}(已记录作者: {author}){Style.RESET}")
+            print()
+            author = input(f"  {Style.CYAN}请输入作者名 (可选,按回车跳过):{Style.RESET} ").strip()
+            if author:
+                print(f"  {Style.DIM}(已记录作者: {author}){Style.RESET}")
+
+            decision = self._confirm_book_input(book_name, author)
+            if decision == "quit":
+                print()
+                print(f"  {Style.CYAN}好的,下次再一起读书~{Style.RESET}")
+                print()
+                return
+            if decision == "redo":
+                book_name, author = "", ""   # 清空上一次的录入,避免残留
+                print()
+                continue
+            break
 
         previous = load_session(book_name, author)
 
@@ -1287,7 +1670,7 @@ class ReadingBuddyAgent:
             prev_model = previous.get("model", self.model)
             prev_author = previous.get("author", "")
             prev_author_info = previous.get("author_info", "")
-            prev_provider = previous.get("provider", "")
+            prev_backend = previous.get("protocol") or previous.get("provider", "")
             prev_count = len(prev_msg)
 
             label = format_book_label(book_name, prev_author or author)
@@ -1298,7 +1681,7 @@ class ReadingBuddyAgent:
             print(f"  {Style.DIM}  对话数: {prev_count} 条{Style.RESET}")
             print(f"  {Style.DIM}  上次更新: {format_datetime(prev_updated)}{Style.RESET}")
             print(f"  {Style.DIM}  模式: {'经典引导' if prev_mode == 'known' else '盲盒盲读'}{Style.RESET}")
-            print(f"  {Style.DIM}  后端: {prev_provider} · 模型: {prev_model}{Style.RESET}")
+            print(f"  {Style.DIM}  后端: {prev_backend} · 模型: {prev_model}{Style.RESET}")
             print()
 
             # 上次异常退出 (Ctrl+C / 关窗口 / 崩溃) 时,退出环节的提炼没跑成 → 先基于存档补做。
@@ -1335,9 +1718,8 @@ class ReadingBuddyAgent:
                 self.author = prev_author or author
                 self.mode = prev_mode
                 self.author_info = prev_author_info
-                self.model = prev_model if prev_model else self.model
-                self.mindmap_model = previous.get("mindmap_model") or self.model
-                self.base_url = previous.get("base_url") or self.base_url
+                # 模型与服务跟随当前配置 (旧存档只恢复对话内容),
+                # 避免换服务后继续会话被旧存档带回老地址
                 self.messages = prev_msg
                 self._session_created_at = previous.get("created_at", datetime.now(timezone.utc).isoformat())
                 self._session_updated_at = prev_updated
@@ -1348,9 +1730,8 @@ class ReadingBuddyAgent:
             self.start_session(book_name, self.author, resume=False)
 
         print()
-        info = PROVIDER_INFO[self.provider]
-        print(f"  {Style.DIM}━━━  后端: {info['name']} | 每次回答后自动存档 & 更新脑图  ━━━{Style.RESET}")
-        print(f"  {Style.DIM}  命令: /model 切换模型 | /author 作者背景 | /profile 画像&记忆 | /save 手动存档 | /history 历史 | /quit 退出{Style.RESET}")
+        print(f"  {Style.DIM}━━━  服务: {self.service_label} | 每次回答后自动存档 & 更新脑图  ━━━{Style.RESET}")
+        print(f"  {Style.DIM}  命令: /model 切换模型 | /config 切换服务 | /author 作者背景 | /profile 画像&记忆 | /save 手动存档 | /history 历史 | /quit 退出{Style.RESET}")
         print()
 
         turn_count = (len(self.messages) // 2) + 1
@@ -1397,33 +1778,44 @@ class ReadingBuddyAgent:
 # ===================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="读书笔记总结 Agent — 多后端支持 (Anthropic / DeepSeek)",
+        description="读书笔记总结 Agent — 任何 OpenAI 兼容服务 / Anthropic 原生均可接入",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             示例:
-              python agent.py                                    # 自动检测 Key 类型
-              python agent.py --provider deepseek                # 使用 DeepSeek
-              python agent.py --provider anthropic               # 使用 Anthropic
-              python agent.py --api-key sk-xxx --model deepseek-chat
+              python agent.py                                    # 配置来自环境变量 / config.json
+              python agent.py --protocol anthropic               # 强制 Anthropic 原生协议
+              python agent.py --api-key sk-xxx --base-url https://api.deepseek.com --model deepseek-chat
               python agent.py --reset-config
               python agent.py --list-sessions
+
+            配置优先级: 环境变量 > config.json > .reading_buddy_config.json (老版本兼容)
+            环境变量: OPENAI_API_KEY (+可选 OPENAI_BASE_URL / OPENAI_MODEL),
+            DEEPSEEK_API_KEY, ANTHROPIC_API_KEY (+可选 ANTHROPIC_MODEL)
         """),
     )
     parser.add_argument("--api-key", "-k", default=None, help="API Key")
-    parser.add_argument("--provider", "-p", default=None, choices=["anthropic", "deepseek", "auto"], help="后端 (默认: auto 自动检测)")
+    parser.add_argument("--protocol", "-p", default=None,
+                        choices=["openai_compatible", "anthropic", "auto"],
+                        help="协议 (默认: auto — 按配置文件 / Key 前缀判断)")
+    parser.add_argument("--provider", default=None,
+                        choices=["anthropic", "deepseek", "openai_compatible", "auto"],
+                        help="(老版本兼容) 等价 --protocol, 将被弃用")
     parser.add_argument("--model", "-m", default=None, help="对话模型")
     parser.add_argument("--mindmap-model", default=None, help="脑图模型")
-    parser.add_argument("--base-url", default=None, help="API 地址 (默认根据后端自动设置)")
+    parser.add_argument("--base-url", default=None, help="API 地址 (常见服务对照见 config.example.json)")
     parser.add_argument("--reset-config", action="store_true", help="重置配置文件")
     parser.add_argument("--list-sessions", action="store_true", help="列出存档会话")
     args = parser.parse_args()
 
     if args.reset_config:
-        if CONFIG_FILE.exists():
-            CONFIG_FILE.unlink()
-            print(f"  {Style.GREEN}[OK] 配置文件已重置{Style.RESET}")
-        else:
-            print(f"  {Style.DIM}配置文件不存在{Style.RESET}")
+        removed = False
+        for path in (CONFIG_FILE, LEGACY_CONFIG_FILE):
+            if path.exists():
+                path.unlink()
+                print(f"  {Style.GREEN}[OK] 已删除 {path.name}{Style.RESET}")
+                removed = True
+        if not removed:
+            print(f"  {Style.DIM}没有发现配置文件{Style.RESET}")
         return
 
     if args.list_sessions:
@@ -1436,78 +1828,111 @@ def main():
                 icon = "📖" if s["mode"] == "known" else "📦"
                 label = format_book_label(s["book_name"], s.get("author", ""))
                 print(f"  {Style.CYAN}{i}.{Style.RESET} {icon} {Style.BOLD}{label}{Style.RESET}")
-                print(f"     {Style.DIM}{s['message_count']} 条 · {format_datetime(s['updated_at'])} · {s.get('provider','')} · {s['model']}{Style.RESET}")
+                print(f"     {Style.DIM}{s['message_count']} 条 · {format_datetime(s['updated_at'])} · {s.get('backend','')} · {s['model']}{Style.RESET}")
             print()
         else:
             print(f"  {Style.DIM}暂无存档{Style.RESET}")
         return
 
-    # --- 加载/合并配置 ---
-    config = load_config()
+    # --- 解析配置: CLI 参数 > 环境变量 > config.json > .reading_buddy_config.json ---
+    raw_file, file_name = read_config_file()
+    file_cfg = normalize_config(raw_file) if raw_file else None
+    env_cfg, env_source = config_from_env()
 
-    # API Key
-    api_key = args.api_key or config.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
+    if env_cfg is not None:
+        # 环境变量配置自带完整默认值, 仅借用配置文件里的 mindmap_model
+        cfg = dict(DEFAULT_CONFIG)
+        if file_cfg and file_cfg.get("mindmap_model"):
+            cfg["mindmap_model"] = file_cfg["mindmap_model"]
+        cfg.update(env_cfg)
+        config_source = env_source
+    elif file_cfg is not None:
+        cfg = file_cfg
+        config_source = file_name
+    else:
+        cfg = dict(DEFAULT_CONFIG)
+        config_source = ""
+
+    # CLI 参数覆盖 (老 --provider 参数映射为协议名)
+    if args.provider and not args.protocol:
+        args.protocol = {"anthropic": "anthropic", "deepseek": "openai_compatible",
+                         "openai_compatible": "openai_compatible"}.get(args.provider, "auto")
+        print(f"  {Style.YELLOW}[!] --provider 已由 --protocol 取代, 本次已自动映射{Style.RESET}")
+    cli_overrode = False
+    if args.api_key and args.api_key != cfg.get("api_key"):
+        cfg["api_key"] = args.api_key
+        cli_overrode = True
+    if args.protocol and args.protocol != cfg.get("protocol"):
+        cfg["protocol"] = args.protocol
+        cli_overrode = True
+    if args.model and args.model != cfg.get("model"):
+        cfg["model"] = args.model
+        cli_overrode = True
+    if args.mindmap_model and args.mindmap_model != cfg.get("mindmap_model"):
+        cfg["mindmap_model"] = args.mindmap_model
+        cli_overrode = True
+    if args.base_url and args.base_url != cfg.get("base_url"):
+        cfg["base_url"] = args.base_url
+        cli_overrode = True
+
+    # API Key: 缺失 → 友好指引后退出 (本地 Ollama 无需真实 Key)
+    api_key = (cfg.get("api_key") or "").strip()
     if not api_key:
-        print()
-        print(f"  {Style.YELLOW}[!] 首次使用需要设置 API Key{Style.RESET}")
-        print(f"  {Style.DIM}  Anthropic: https://console.anthropic.com/{Style.RESET}")
-        print(f"  {Style.DIM}  DeepSeek:  https://platform.deepseek.com/{Style.RESET}")
-        print()
-        api_key = input(f"  {Style.CYAN}请粘贴你的 API Key:{Style.RESET} ").strip()
-        if not api_key:
-            print(f"  {Style.RED}[ERROR] 需要 API Key{Style.RESET}")
-            sys.exit(1)
-        config["api_key"] = api_key
-        save_config(config)
-        print(f"  {Style.GREEN}[OK] API Key 已保存{Style.RESET}")
+        if is_local_url(cfg.get("base_url")):
+            api_key = "ollama"
+            cfg["api_key"] = api_key
+        else:
+            print_setup_guide("未找到 API Key 配置 — 请先完成配置再启动")
 
-    if args.api_key and args.api_key != config.get("api_key"):
-        config["api_key"] = args.api_key
-        save_config(config)
-        print(f"  {Style.GREEN}[OK] API Key 已更新{Style.RESET}")
+    # 协议: auto → 按 Key 前缀判断
+    protocol = (cfg.get("protocol") or "auto").lower()
+    if protocol == "auto":
+        protocol = detect_protocol(api_key)
+    if protocol not in PROTOCOL_LABELS:
+        protocol = "openai_compatible"
 
-    # Provider
-    provider = args.provider or config.get("provider") or "auto"
-    if provider == "auto":
-        provider = detect_provider(api_key)
-    if args.provider and args.provider != config.get("provider"):
-        config["provider"] = args.provider
-        save_config(config)
+    # base_url: OpenAI 兼容但未填地址 → 兜底 DeepSeek (同老版本行为;
+    # 使用其他服务时请在 config.json 显式填写 base_url)
+    base_url = cfg.get("base_url")
+    if protocol == "openai_compatible" and not base_url:
+        base_url = KNOWN_SERVICES["deepseek"]["base_url"]
 
-    pinfo = PROVIDER_INFO[provider]
+    # 模型: 显式配置优先, 其次已知服务的默认模型; 仍为空 → 提示填写后退出
+    service_key = "anthropic" if protocol == "anthropic" else find_service(base_url or "")
+    service = KNOWN_SERVICES.get(service_key) if service_key else None
+    model = (cfg.get("model") or "").strip() or (service or {}).get("default_model") or ""
+    if not model:
+        print_model_guide(base_url)
 
-    # Model
-    model = args.model or config.get("model") or pinfo["default_model"]
-    mindmap_model = args.mindmap_model or config.get("mindmap_model") or model
+    mindmap_model = cfg.get("mindmap_model") or model
 
-    # Base URL
-    base_url = args.base_url or config.get("base_url") or pinfo["default_base_url"]
-
-    if args.model and args.model != config.get("model"):
-        config["model"] = args.model
-        save_config(config)
-    if args.base_url and args.base_url != config.get("base_url"):
-        config["base_url"] = args.base_url
-        save_config(config)
-    if not config.get("provider") or config["provider"] == "auto":
-        config["provider"] = provider
-        save_config(config)
+    # CLI 显式指定且配置并非来自环境变量 → 持久化到 config.json
+    # (同老版行为: 首次 --api-key 启动即保存; 环境变量用户不写文件, 避免两套来源打架)
+    if cli_overrode and env_cfg is None:
+        save_config({
+            "api_key": api_key,
+            "protocol": protocol,
+            "model": model,
+            "mindmap_model": mindmap_model,
+            "base_url": base_url,
+        })
+        print(f"  {Style.GREEN}[OK] 配置已保存到 {CONFIG_FILE.name}{Style.RESET}")
 
     # --- 显示配置 ---
+    service_label = service["name"] if service else "自定义服务"
     print()
-    print(f"  {Style.DIM}配置:{Style.RESET}")
-    print(f"  {Style.DIM}  后端: {pinfo['name']}{Style.RESET}")
-    if config.get("api_key"):
-        print(f"  {Style.DIM}  API Key: {obfuscate_key(config['api_key'])} (已保存){Style.RESET}")
+    print(f"  {Style.DIM}配置{f' (来源: {config_source})' if config_source else ''}:{Style.RESET}")
+    print(f"  {Style.DIM}  协议: {PROTOCOL_LABELS[protocol]} · 服务: {service_label}{Style.RESET}")
+    print(f"  {Style.DIM}  API Key: {obfuscate_key(api_key)}{Style.RESET}")
     print(f"  {Style.DIM}  对话模型: {model}{Style.RESET}")
-    if args.mindmap_model:
+    if mindmap_model != model:
         print(f"  {Style.DIM}  脑图模型: {mindmap_model}{Style.RESET}")
     if base_url:
         print(f"  {Style.DIM}  API: {base_url}{Style.RESET}")
     print()
 
     # --- 检查依赖 ---
-    if provider == "anthropic":
+    if protocol == "anthropic":
         try:
             import anthropic  # noqa
         except ImportError:
@@ -1523,10 +1948,11 @@ def main():
     # --- 启动 ---
     agent = ReadingBuddyAgent(
         api_key=api_key,
-        provider=provider,
+        protocol=protocol,
         model=model,
         mindmap_model=mindmap_model,
         base_url=base_url,
+        config_from_env=env_cfg is not None,
     )
     try:
         agent.run()

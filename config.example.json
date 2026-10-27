@@ -1,0 +1,7 @@
+{
+  "protocol": "openai_compatible",
+  "api_key": "在这里填入你的 API Key",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-chat",
+  "mindmap_model": null
+}

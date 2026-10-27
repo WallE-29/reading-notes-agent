@@ -33,42 +33,45 @@
 - 💬 **对话式读书体验**：多轮交流推进，不是一次性问答
 - 🧠 **会话存档 & 记忆恢复**：它记得你们上次聊到哪，续读不断档
 - 📝 **双格式笔记自动生成**：Mermaid 脑图 + 幕布大纲，每轮对话后沉淀
-- 🤖 **多模型后端**：Anthropic Claude / DeepSeek（OpenAI 兼容），运行时 `/model` 切换
+- 🤖 **多模型后端**：任意 OpenAI 兼容服务（DeepSeek / GLM / Kimi / 通义 / 本地 Ollama…）或 Anthropic 原生，运行时 `/model`、`/config` 切换
 - 📖 **书名 + 作者双字段录入**：防同名书混淆，支持智能作者背景检索
-- ⚙️ **灵活的 Key 配置**：`--api-key` 参数或本地 config 文件持久化
+- ⚙️ **灵活的 Key 配置**：环境变量 / `config.json`（模板 `config.example.json`）/ `--api-key` 参数
 
 ## 效果示例
 
-`notes/` 目录包含两本书的真实生成笔记：
+`notes/` 目录包含四本书的真实生成笔记：
 
 | 书名 | 作者 | 笔记 |
 |------|------|------|
 | 妻妾成群 | 苏童 | 可视化脑图 + 幕布导入版 |
 | 涛动周期论 | 周金涛 | 可视化脑图 + 幕布导入版 |
+| 1984 | 乔治·奥威尔 | 可视化脑图 + 幕布导入版 |
+| 我与地坛 | 史铁生 | 可视化脑图 + 幕布导入版 |
 
 ## 快速开始
 
 ```bash
-# 1. 准备一个 API Key（Anthropic 或 DeepSeek）
+# 1. 准备一个 API Key（任一 OpenAI 兼容服务，或 Anthropic）
 
-# 2. 直接运行，自动检测 Key 类型
+# 2. 直接运行（配置来自环境变量 / config.json）
 python agent.py
 
-# 或显式指定后端 / Key
-python agent.py --provider deepseek
-python agent.py --provider anthropic
-python agent.py --api-key sk-xxx --model deepseek-chat
+# 或复制 config.example.json 为 config.json，填入 api_key / base_url / model
+
+# 或命令行显式指定
+python agent.py --protocol anthropic
+python agent.py --api-key sk-xxx --base-url https://api.deepseek.com --model deepseek-chat
 
 # 重置本地配置
 python agent.py --reset-config
 ```
 
-首次运行后，Key 会保存在本地 `.reading_buddy_config.json`（已被 `.gitignore` 排除，不会上传）。
+Key 保存在本地 `config.json`（复制 `config.example.json` 填写即可；已被 `.gitignore` 排除，不会上传）。设置了 `OPENAI_API_KEY` 等环境变量时以环境变量优先。
 
 ## 技术栈
 
 - Python 3（标准库）
-- Anthropic Claude API / DeepSeek API（OpenAI 兼容）
+- 任意 OpenAI 兼容 API（DeepSeek / GLM / Kimi / 通义 / Ollama…）或 Anthropic 原生
 - Mermaid mindmap 语法
 
 ## 开发方式
