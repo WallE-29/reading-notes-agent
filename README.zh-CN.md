@@ -33,37 +33,66 @@
 - 💬 **对话式读书体验**：多轮交流推进，不是一次性问答
 - 🧠 **会话存档 & 记忆恢复**：它记得你们上次聊到哪，续读不断档
 - 📝 **双格式笔记自动生成**：Mermaid 脑图 + 幕布大纲，每轮对话后沉淀
+- 📚 **书架 Dashboard**：本地网页展示读过的书、读者画像、跨书记忆（`python shelf.py`）
+- 🔌 **可作为 Agent Skill 分发**：遵循开放的 [Agent Skills](https://agentskills.io) 规范，可被 Cursor / Claude Code / Copilot / Codex 等 40+ Agent 自动发现调用
 - 🤖 **多模型后端**：任意 OpenAI 兼容服务（DeepSeek / GLM / Kimi / 通义 / 本地 Ollama…）或 Anthropic 原生，运行时 `/model`、`/config` 切换
 - 📖 **书名 + 作者双字段录入**：防同名书混淆，支持智能作者背景检索
 - ⚙️ **灵活的 Key 配置**：环境变量 / `config.json`（模板 `config.example.json`）/ `--api-key` 参数
 
+## 作为 Agent Skill 安装
+
+本仓库遵循开放的 **Agent Skills** 规范（一个包含 `SKILL.md` 的文件夹）。
+安装后，你的 Agent 会自动发现本技能，并在你提到读书笔记相关需求时自动调用，
+不用记命令。
+
+```bash
+git clone https://github.com/WallE-29/reading-notes-agent.git
+
+# Cursor / Claude Code —— 项目级
+mkdir -p .claude/skills
+cp -r reading-notes-agent .claude/skills/book-notes-buddy
+
+# Cursor / Claude Code —— 全局
+cp -r reading-notes-agent ~/.claude/skills/book-notes-buddy
+
+# 或者直接当命令行工具用
+cd reading-notes-agent && pip install openai && python agent.py
+```
+
+兼容的 Agent 会从 `.claude/skills/`、`.cursor/skills/`、`.agents/skills/`
+及其全局目录加载 `SKILL.md`。
+
 ## 效果示例
 
-`notes/` 目录包含四本书的真实生成笔记：
+`examples/` 里有一份示例笔记（《活着》/ 余华），展示真实产出的格式：
 
-| 书名 | 作者 | 笔记 |
-|------|------|------|
-| 妻妾成群 | 苏童 | 可视化脑图 + 幕布导入版 |
-| 涛动周期论 | 周金涛 | 可视化脑图 + 幕布导入版 |
-| 1984 | 乔治·奥威尔 | 可视化脑图 + 幕布导入版 |
-| 我与地坛 | 史铁生 | 可视化脑图 + 幕布导入版 |
+| 示例文件 | 格式 |
+|----------|------|
+| `examples/示例_可视化脑图.md` | Mermaid 思维导图 |
+| `examples/示例_幕布导入版.md` | 幕布 / Xmind 大纲 |
+
+把它复制进 `notes/` 就能预览书架效果，或直接对你自己想读的书跑一遍。
+你生成的笔记会落在 `notes/`，该目录已被 gitignore——阅读数据只留在本地。
 
 ## 快速开始
 
 ```bash
 # 1. 准备一个 API Key（任一 OpenAI 兼容服务，或 Anthropic）
 
-# 2. 直接运行（配置来自环境变量 / config.json）
+# 2. 开始聊书（Agent）
 python agent.py
 
 # 或复制 config.example.json 为 config.json，填入 api_key / base_url / model
-
 # 或命令行显式指定
 python agent.py --protocol anthropic
 python agent.py --api-key sk-xxx --base-url https://api.deepseek.com --model deepseek-chat
 
-# 重置本地配置
-python agent.py --reset-config
+# 其他常用
+python agent.py --reset-config      # 重置本地配置
+python agent.py --list-sessions     # 列出所有存档会话
+
+# 3. 查看书架（本地网页，仅 127.0.0.1）
+python shelf.py                     # → http://127.0.0.1:8766
 ```
 
 Key 保存在本地 `config.json`（复制 `config.example.json` 填写即可；已被 `.gitignore` 排除，不会上传）。设置了 `OPENAI_API_KEY` 等环境变量时以环境变量优先。
