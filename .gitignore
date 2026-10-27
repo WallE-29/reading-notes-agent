@@ -7,6 +7,7 @@ config.json
 
 # === 会话数据（个人隐私）===
 sessions/
+notes/
 memory.md
 profile.md
 *.tmp
